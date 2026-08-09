@@ -1,0 +1,43 @@
+services:
+  # ----------------------------------------------------------------------
+  # 벡터 DB : pgvector 확장이 미리 포함된 Postgres 이미지
+  # 포트를 외부에 노출하지 않음 → 같은 네트워크의 app 컨테이너만 접근
+  # ----------------------------------------------------------------------
+  db:
+    image: pgvector/pgvector:pg16
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      # 데이터 영속성: 컨테이너를 지우거나 교체해도 데이터는 이 볼륨에 남는다
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ----------------------------------------------------------------------
+  # RAG 앱 : FastAPI + LlamaIndex
+  # ----------------------------------------------------------------------
+  app:
+    build: .
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy   # DB가 준비된 뒤에 앱을 띄운다
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      POSTGRES_HOST: db              # compose 네트워크에서 서비스 이름으로 접속
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      INGEST_TOKEN: ${INGEST_TOKEN}  # /ingest 보호용 토큰
+    ports:
+      - "80:8000"                    # 외부 80 → 앱 8000
+
+volumes:
+  pgdata:
