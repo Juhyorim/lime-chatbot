@@ -1,1 +1,40 @@
-asdf
+### 첫 번째 실험
+
+```javascript
+{
+  "tag": "v0_baseline",
+  "top_k": 4,
+  "n_questions": 500,
+  "hit_rate": 0.96,
+  "recall": 0.766,
+  "mrr": 0.9015
+}
+```
+
+- 테이블에 데이터를 중복저장(2번씩)함
+
+### 두 번째 실험
+
+{
+"tag": "v0_diag",
+"top_k": 4,
+"n_questions": 500,
+"hit_rate": 0.97,
+"recall": 0.791,
+"mrr": 0.9062
+}
+
+[1] top-4 슬롯 안의 서로 다른 문서 수
+평균 4.00개 (top_k=4 대비)
+→ 이 값이 top_k보다 크게 작으면, 한 문서가 여러 청크로
+슬롯을 채워 Hit/MRR을 올리고 Recall을 누르는 상태.
+4개 문서: 500
+
+[2] level 별 지표 (누수라면 hard까지 균일하게 높음 → 의심 신호)
+level n hit recall mrr
+hard 500 0.970 0.791 0.906
+
+    type 별 (bridge=멀티홉, comparison=비교)
+    type            n      hit   recall      mrr
+    bridge        388    0.964    0.745    0.895
+    comparison    112    0.991    0.951    0.946

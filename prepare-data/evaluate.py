@@ -102,6 +102,13 @@ def main():
     ap.add_argument("--generate", action="store_true", help="생성 지표(EM/F1)도 측정 (느림·API비용)")
     ap.add_argument("--limit", type=int, default=0, help="생성 평가할 질문 수 (0=전체)")
     ap.add_argument("--results", default="results.jsonl")
+    # --- 진단 옵션 (기존 지표 계산에는 영향 없음) ---
+    ap.add_argument("--diagnose", action="store_true",
+                    help="진단 모드: top-k 내 distinct 문서 수 / level·type별 분해 출력")
+    ap.add_argument("--dump", type=int, default=0,
+                    help="진단 시 눈으로 확인할 샘플 질문 개수 (0=안 함). 검색된 청크 본문·gold 여부 표시")
+    ap.add_argument("--no-record", action="store_true",
+                    help="results.jsonl에 기록하지 않음 (진단만 돌릴 때 결과 오염 방지)")
     args = ap.parse_args()
 
     index = build_index()
@@ -112,6 +119,7 @@ def main():
     hit_sum = recall_sum = mrr_sum = 0.0
     em_sum = f1_sum = 0.0
     gen_n = 0
+    per_rows = []  # 진단 모드에서만 채워짐 (질문별 세부 기록)
 
     query_engine = None
     if args.generate:
@@ -126,15 +134,38 @@ def main():
         nodes = retriever.retrieve(q)
         retrieved_ids = [nd.node.metadata.get("doc_id") for nd in nodes]
 
-        # --- 검색 지표 ---
-        hit_sum += 1.0 if (gold_ids & set(retrieved_ids)) else 0.0
-        recall_sum += len(gold_ids & set(retrieved_ids)) / max(1, len(gold_ids))
+        # --- 검색 지표 (계산값은 원래와 동일, 변수로만 분리) ---
+        retrieved_set = set(retrieved_ids)
+        hit = 1.0 if (gold_ids & retrieved_set) else 0.0
+        rec = len(gold_ids & retrieved_set) / max(1, len(gold_ids))
         rr = 0.0
         for rank, rid in enumerate(retrieved_ids, start=1):
             if rid in gold_ids:
                 rr = 1.0 / rank
                 break
+        hit_sum += hit
+        recall_sum += rec
         mrr_sum += rr
+
+        # --- 진단용 세부 기록 (--diagnose 일 때만) ---
+        if args.diagnose:
+            # top-k 슬롯이 실제로 서로 다른 문서 몇 개를 보고 있는지.
+            # 청킹 때문에 한 문서가 여러 청크로 top-k를 채우면 이 값이 top_k보다 작아진다.
+            distinct_ids = [rid for rid in retrieved_set if rid is not None]
+            per_rows.append({
+                "level": row.get("level", "unknown"),
+                "type": row.get("type", "unknown"),
+                "hit": hit,
+                "recall": rec,
+                "rr": rr,
+                "n_distinct": len(distinct_ids),
+                "n_gold": len(gold_ids),
+                # 샘플 덤프용 (필요할 때만 사용)
+                "question": q,
+                "gold_ids": sorted(gold_ids),
+                "retrieved_ids": retrieved_ids,
+                "snippets": [nd.node.get_content()[:120].replace("\n", " ") for nd in nodes],
+            })
 
         # --- 생성 지표 (옵션) ---
         if query_engine is not None and (args.limit == 0 or gen_n < args.limit):
@@ -156,10 +187,83 @@ def main():
         result["answer_em"] = round(em_sum / gen_n, 4)
         result["answer_f1"] = round(f1_sum / gen_n, 4)
 
-    with open(args.results, "a", encoding="utf-8") as f:
-        f.write(json.dumps(result, ensure_ascii=False) + "\n")
+    if not args.no_record:
+        with open(args.results, "a", encoding="utf-8") as f:
+            f.write(json.dumps(result, ensure_ascii=False) + "\n")
 
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
+    if args.diagnose:
+        print_diagnosis(per_rows, args.top_k, args.dump)
+
+
+def _agg(rows):
+    """행 리스트 -> (n, hit, recall, mrr) 평균."""
+    m = len(rows)
+    if m == 0:
+        return 0, 0.0, 0.0, 0.0
+    return (
+        m,
+        sum(r["hit"] for r in rows) / m,
+        sum(r["recall"] for r in rows) / m,
+        sum(r["rr"] for r in rows) / m,
+    )
+
+
+def print_diagnosis(per_rows, top_k, dump):
+    """baseline이 '진짜'인지 눈으로 확인하기 위한 진단 출력.
+    핵심 질문 3개에 답한다:
+      (1) top-k가 실제로 서로 다른 문서 몇 개를 보고 있나? (청킹 캡 확인)
+      (2) 쉬운 층위/어려운 층위가 제대로 구분되나? (누수면 전부 균일하게 높음)
+      (3) 검색된 청크에 답이 실제로 들어있나? (--dump 로 눈 확인)
+    """
+    print("\n" + "=" * 60)
+    print("진단 (DIAGNOSIS)")
+    print("=" * 60)
+
+    # (1) top-k 내 distinct 문서 수 분포
+    from collections import Counter
+    dist = Counter(r["n_distinct"] for r in per_rows)
+    avg_distinct = sum(r["n_distinct"] for r in per_rows) / max(1, len(per_rows))
+    print(f"\n[1] top-{top_k} 슬롯 안의 서로 다른 문서 수")
+    print(f"    평균 {avg_distinct:.2f}개  (top_k={top_k} 대비)")
+    print(f"    → 이 값이 top_k보다 크게 작으면, 한 문서가 여러 청크로")
+    print(f"      슬롯을 채워 Hit/MRR을 올리고 Recall을 누르는 상태.")
+    for k in sorted(dist):
+        bar = "█" * dist[k]
+        print(f"    {k}개 문서: {dist[k]:4d}  {bar}")
+
+    # (2) level / type 별 분해
+    def by_key(key):
+        buckets = {}
+        for r in per_rows:
+            buckets.setdefault(r[key], []).append(r)
+        return buckets
+
+    print(f"\n[2] level 별 지표  (누수라면 hard까지 균일하게 높음 → 의심 신호)")
+    print(f"    {'level':<10}{'n':>5}{'hit':>9}{'recall':>9}{'mrr':>9}")
+    for lv, rs in sorted(by_key("level").items()):
+        m, h, rc, mr = _agg(rs)
+        print(f"    {lv:<10}{m:>5}{h:>9.3f}{rc:>9.3f}{mr:>9.3f}")
+
+    print(f"\n    type 별 (bridge=멀티홉, comparison=비교)")
+    print(f"    {'type':<12}{'n':>5}{'hit':>9}{'recall':>9}{'mrr':>9}")
+    for tp, rs in sorted(by_key("type").items()):
+        m, h, rc, mr = _agg(rs)
+        print(f"    {tp:<12}{m:>5}{h:>9.3f}{rc:>9.3f}{mr:>9.3f}")
+
+    # (3) 샘플 덤프
+    if dump > 0:
+        print(f"\n[3] 샘플 {dump}개 (질문 / 검색 문서 / gold / 청크 앞부분)")
+        for r in per_rows[:dump]:
+            mark = "HIT " if r["hit"] else "MISS"
+            print(f"\n  [{mark}] recall={r['recall']:.2f}  {r['question']}")
+            print(f"        gold:      {r['gold_ids']}")
+            for rid, snip in zip(r["retrieved_ids"], r["snippets"]):
+                star = " *" if rid in set(r["gold_ids"]) else "  "
+                print(f"      {star} {str(rid):<40} | {snip}")
+
+    print("\n" + "=" * 60)
 
 
 if __name__ == "__main__":
