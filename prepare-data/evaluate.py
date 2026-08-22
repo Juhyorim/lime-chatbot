@@ -15,6 +15,7 @@ lime-rag baseline 평가 (평가 전용 스크립트).
 """
 import argparse
 import json
+import math
 import os
 import re
 import string
@@ -94,10 +95,34 @@ def load_eval(path):
         return [json.loads(line) for line in f]
 
 
+# ---- 순위 품질 지표: nDCG@k ----
+def ndcg_at_k(retrieved_ids, gold_ids, k):
+    """gold를 이진 relevance(1/0)로 보고 nDCG@k 계산.
+    gold가 위쪽 순위에 있을수록 점수가 높다 → 리랭킹 효과를 잡아내는 지표.
+    DCG  = Σ rel_i / log2(i+1)   (i=1..k)
+    IDCG = gold를 이상적으로 위에 몰아넣었을 때의 DCG
+    """
+    dcg = 0.0
+    for i, rid in enumerate(retrieved_ids[:k], start=1):
+        if rid in gold_ids:
+            dcg += 1.0 / math.log2(i + 1)
+    ideal_hits = min(len(gold_ids), k)
+    idcg = sum(1.0 / math.log2(i + 1) for i in range(1, ideal_hits + 1))
+    return dcg / idcg if idcg > 0 else 0.0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--eval", default="eval_set.jsonl")
-    ap.add_argument("--top-k", type=int, default=4, help="main.py의 similarity_top_k와 동일")
+    # --- 검색 깊이: retrieve(넓게 건짐)와 eval(최종 평가 깊이)을 분리 ---
+    # 리랭킹/하이브리드는 넓게 건진 뒤 좁게 추리므로 두 값이 달라진다.
+    # 리랭커가 없으면 retrieve_k == eval_k → 기존 동작과 동일.
+    ap.add_argument("--eval-k", type=int, default=4,
+                    help="지표를 계산할 최종 순위 깊이 (main.py의 similarity_top_k와 동일)")
+    ap.add_argument("--retrieve-k", type=int, default=0,
+                    help="검색해서 뽑을 후보 수 (0=eval-k와 동일). 리랭킹·하이브리드의 재료")
+    ap.add_argument("--top-k", type=int, default=None,
+                    help="(구버전 호환) 주면 --eval-k로 취급됨")
     ap.add_argument("--tag", default="v0_baseline", help="실험 버전 이름 (기록용)")
     ap.add_argument("--generate", action="store_true", help="생성 지표(EM/F1)도 측정 (느림·API비용)")
     ap.add_argument("--limit", type=int, default=0, help="생성 평가할 질문 수 (0=전체)")
@@ -111,12 +136,18 @@ def main():
                     help="results.jsonl에 기록하지 않음 (진단만 돌릴 때 결과 오염 방지)")
     args = ap.parse_args()
 
+    # 검색 깊이 확정: --top-k(구버전)가 오면 eval_k로 취급. retrieve_k 0이면 eval_k와 동일.
+    eval_k = args.top_k if args.top_k is not None else args.eval_k
+    retrieve_k = args.retrieve_k if args.retrieve_k > 0 else eval_k
+    if retrieve_k < eval_k:
+        retrieve_k = eval_k  # 평가 깊이보다 적게 건지면 안 됨
+
     index = build_index()
-    retriever = index.as_retriever(similarity_top_k=args.top_k)
+    retriever = index.as_retriever(similarity_top_k=retrieve_k)
     rows = load_eval(args.eval)
     n = len(rows)
 
-    hit_sum = recall_sum = mrr_sum = 0.0
+    hit_sum = hit1_sum = recall_sum = mrr_sum = ndcg_sum = 0.0
     em_sum = f1_sum = 0.0
     gen_n = 0
     per_rows = []  # 진단 모드에서만 채워짐 (질문별 세부 기록)
@@ -124,7 +155,7 @@ def main():
     query_engine = None
     if args.generate:
         query_engine = index.as_query_engine(
-            similarity_top_k=args.top_k, text_qa_template=EVAL_QA_PROMPT
+            similarity_top_k=eval_k, text_qa_template=EVAL_QA_PROMPT
         )
 
     for row in rows:
@@ -132,32 +163,44 @@ def main():
         gold_ids = set(row["gold_doc_ids"])
 
         nodes = retriever.retrieve(q)
+
+        # === 리랭킹/하이브리드가 들어갈 자리 ===
+        # 지금은 리랭커가 없으므로 검색 순서 그대로. 리랭커를 붙이면 여기서
+        # nodes 를 재정렬한 뒤 아래에서 eval_k 로 자르면 된다.
+        nodes = nodes[:eval_k]  # 넓게 건진 뒤 최종 평가 깊이로 추림
+
         retrieved_ids = [nd.node.metadata.get("doc_id") for nd in nodes]
 
-        # --- 검색 지표 (계산값은 원래와 동일, 변수로만 분리) ---
+        # --- 검색 지표 ---
         retrieved_set = set(retrieved_ids)
         hit = 1.0 if (gold_ids & retrieved_set) else 0.0
+        hit1 = 1.0 if (retrieved_ids and retrieved_ids[0] in gold_ids) else 0.0
         rec = len(gold_ids & retrieved_set) / max(1, len(gold_ids))
         rr = 0.0
         for rank, rid in enumerate(retrieved_ids, start=1):
             if rid in gold_ids:
                 rr = 1.0 / rank
                 break
+        ndcg = ndcg_at_k(retrieved_ids, gold_ids, eval_k)
         hit_sum += hit
+        hit1_sum += hit1
         recall_sum += rec
         mrr_sum += rr
+        ndcg_sum += ndcg
 
         # --- 진단용 세부 기록 (--diagnose 일 때만) ---
         if args.diagnose:
-            # top-k 슬롯이 실제로 서로 다른 문서 몇 개를 보고 있는지.
-            # 청킹 때문에 한 문서가 여러 청크로 top-k를 채우면 이 값이 top_k보다 작아진다.
+            # eval_k 슬롯이 실제로 서로 다른 문서 몇 개를 보고 있는지.
+            # 청킹/중복 때문에 한 문서가 여러 청크로 슬롯을 채우면 이 값이 eval_k보다 작아진다.
             distinct_ids = [rid for rid in retrieved_set if rid is not None]
             per_rows.append({
                 "level": row.get("level", "unknown"),
                 "type": row.get("type", "unknown"),
                 "hit": hit,
+                "hit1": hit1,
                 "recall": rec,
                 "rr": rr,
+                "ndcg": ndcg,
                 "n_distinct": len(distinct_ids),
                 "n_gold": len(gold_ids),
                 # 샘플 덤프용 (필요할 때만 사용)
@@ -176,11 +219,15 @@ def main():
 
     result = {
         "tag": args.tag,
-        "top_k": args.top_k,
+        "retrieve_k": retrieve_k,
+        "eval_k": eval_k,
+        "top_k": eval_k,  # 구버전 기록과 grep 호환용 (= eval_k)
         "n_questions": n,
-        "hit_rate": round(hit_sum / n, 4),
+        "hit@1": round(hit1_sum / n, 4),
+        "hit_rate": round(hit_sum / n, 4),  # = hit@eval_k
         "recall": round(recall_sum / n, 4),
         "mrr": round(mrr_sum / n, 4),
+        "ndcg": round(ndcg_sum / n, 4),
     }
     if gen_n:
         result["gen_n"] = gen_n
@@ -194,19 +241,21 @@ def main():
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
     if args.diagnose:
-        print_diagnosis(per_rows, args.top_k, args.dump)
+        print_diagnosis(per_rows, eval_k, args.dump)
 
 
 def _agg(rows):
-    """행 리스트 -> (n, hit, recall, mrr) 평균."""
+    """행 리스트 -> (n, hit, hit1, recall, mrr, ndcg) 평균."""
     m = len(rows)
     if m == 0:
-        return 0, 0.0, 0.0, 0.0
+        return 0, 0.0, 0.0, 0.0, 0.0, 0.0
     return (
         m,
         sum(r["hit"] for r in rows) / m,
+        sum(r["hit1"] for r in rows) / m,
         sum(r["recall"] for r in rows) / m,
         sum(r["rr"] for r in rows) / m,
+        sum(r["ndcg"] for r in rows) / m,
     )
 
 
@@ -221,13 +270,13 @@ def print_diagnosis(per_rows, top_k, dump):
     print("진단 (DIAGNOSIS)")
     print("=" * 60)
 
-    # (1) top-k 내 distinct 문서 수 분포
+    # (1) eval-k 내 distinct 문서 수 분포
     from collections import Counter
     dist = Counter(r["n_distinct"] for r in per_rows)
     avg_distinct = sum(r["n_distinct"] for r in per_rows) / max(1, len(per_rows))
-    print(f"\n[1] top-{top_k} 슬롯 안의 서로 다른 문서 수")
-    print(f"    평균 {avg_distinct:.2f}개  (top_k={top_k} 대비)")
-    print(f"    → 이 값이 top_k보다 크게 작으면, 한 문서가 여러 청크로")
+    print(f"\n[1] eval-{top_k} 슬롯 안의 서로 다른 문서 수")
+    print(f"    평균 {avg_distinct:.2f}개  (eval_k={top_k} 대비)")
+    print(f"    → 이 값이 eval_k보다 크게 작으면, 한 문서가 여러 청크로")
     print(f"      슬롯을 채워 Hit/MRR을 올리고 Recall을 누르는 상태.")
     for k in sorted(dist):
         bar = "█" * dist[k]
@@ -240,17 +289,18 @@ def print_diagnosis(per_rows, top_k, dump):
             buckets.setdefault(r[key], []).append(r)
         return buckets
 
+    hdr = f"    {'':<12}{'n':>5}{'hit@1':>9}{'hit':>9}{'recall':>9}{'mrr':>9}{'ndcg':>9}"
     print(f"\n[2] level 별 지표  (누수라면 hard까지 균일하게 높음 → 의심 신호)")
-    print(f"    {'level':<10}{'n':>5}{'hit':>9}{'recall':>9}{'mrr':>9}")
+    print(hdr)
     for lv, rs in sorted(by_key("level").items()):
-        m, h, rc, mr = _agg(rs)
-        print(f"    {lv:<10}{m:>5}{h:>9.3f}{rc:>9.3f}{mr:>9.3f}")
+        m, h, h1, rc, mr, nd = _agg(rs)
+        print(f"    {lv:<12}{m:>5}{h1:>9.3f}{h:>9.3f}{rc:>9.3f}{mr:>9.3f}{nd:>9.3f}")
 
     print(f"\n    type 별 (bridge=멀티홉, comparison=비교)")
-    print(f"    {'type':<12}{'n':>5}{'hit':>9}{'recall':>9}{'mrr':>9}")
+    print(hdr)
     for tp, rs in sorted(by_key("type").items()):
-        m, h, rc, mr = _agg(rs)
-        print(f"    {tp:<12}{m:>5}{h:>9.3f}{rc:>9.3f}{mr:>9.3f}")
+        m, h, h1, rc, mr, nd = _agg(rs)
+        print(f"    {tp:<12}{m:>5}{h1:>9.3f}{h:>9.3f}{rc:>9.3f}{mr:>9.3f}{nd:>9.3f}")
 
     # (3) 샘플 덤프
     if dump > 0:

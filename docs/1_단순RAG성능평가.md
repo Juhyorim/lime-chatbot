@@ -31,10 +31,46 @@
 4개 문서: 500
 
 [2] level 별 지표 (누수라면 hard까지 균일하게 높음 → 의심 신호)
-level n hit recall mrr
-hard 500 0.970 0.791 0.906
+
+```
+    level         n      hit     recall    mrr
+    hard          500    0.970   0.791    0.906
 
     type 별 (bridge=멀티홉, comparison=비교)
     type            n      hit   recall      mrr
     bridge        388    0.964    0.745    0.895
     comparison    112    0.991    0.951    0.946
+```
+
+### 세 번째 실험 - hit@1
+
+{
+"tag": "v0_hit1",
+"retrieve_k": 4,
+"eval_k": 4,
+"top_k": 4,
+"n_questions": 500,
+"hit@1": 0.86,
+"hit_rate": 0.97,
+"recall": 0.791,
+"mrr": 0.9062,
+"ndcg": 0.7849
+}
+
+[1] eval-4 슬롯 안의 서로 다른 문서 수
+평균 4.00개 (eval_k=4 대비)
+→ 이 값이 eval_k보다 크게 작으면, 한 문서가 여러 청크로
+슬롯을 채워 Hit/MRR을 올리고 Recall을 누르는 상태.
+4개 문서: 500
+
+[2] level 별 지표 (누수라면 hard까지 균일하게 높음 → 의심 신호)
+
+```
+                    n    hit@1      hit   recall      mrr     ndcg
+    hard          500    0.860    0.970    0.791    0.906    0.785
+
+    type 별 (bridge=멀티홉, comparison=비교)
+                    n    hit@1      hit   recall      mrr     ndcg
+    bridge        388    0.845    0.964    0.745    0.895    0.745
+    comparison    112    0.911    0.991    0.951    0.946    0.924
+```
