@@ -50,7 +50,10 @@ def main():
     args = ap.parse_args()
 
     # lime-rag와 동일한 임베딩 모델이어야 검색이 일관된다.
-    Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
+    Settings.embed_model = OpenAIEmbedding(
+        model="text-embedding-3-small",
+        embed_batch_size=16,
+    )
     Settings.node_parser = SentenceSplitter(
         chunk_size=args.chunk_size, chunk_overlap=args.chunk_overlap
     )
@@ -75,8 +78,11 @@ def main():
 
     docs = load_corpus(args.corpus)
     storage = StorageContext.from_defaults(vector_store=vector_store)
-    VectorStoreIndex.from_documents(docs, storage_context=storage, show_progress=True)
-
+    VectorStoreIndex.from_documents(
+        docs, storage_context=storage, show_progress=True,
+        insert_batch_size=16,   # 기본 2048 -> 16개씩 나눠서 DB에 삽입 (메모리 압박 완화)
+    )
+    
     print(f"문단 {len(docs)}개 적재 완료 -> 테이블 data_{args.table}")
 
 
